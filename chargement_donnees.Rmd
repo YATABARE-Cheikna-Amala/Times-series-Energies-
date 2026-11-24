@@ -1,0 +1,374 @@
+---
+title: "Chargement des données et construction des séries de consommation"
+subtitle: "Consommation électrique française : sources brutes, séries horaire et journalière"
+author: "Projet Advanced Time Series "
+date: "`r format(Sys.Date(), '%d/%m/%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+    df_print: kable
+    theme: flatly
+    highlight: tango
+params:
+  refresh: false            # TRUE : retélécharge toutes les sources brutes
+  dossier_brut: "data/raw"
+  dossier_sortie: "data/processed"
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, comment = "",
+                      fig.width = 10, fig.height = 5, dpi = 110, fig.align = "center",
+                      out.width = "100%")
+suppressPackageStartupMessages({
+  library(dplyr)                 # chargé avant data.table pour que data.table garde ses fonctions
+  library(data.table); library(curl); library(jsonlite); library(knitr); library(kableExtra)
+})
+source("R/00_theme.R")           
+options(knitr.kable.NA = "")
+tab <- function(x, digits = 1, ...) kbl(x, digits = digits, format.args = list(big.mark = " "), ...) |>
+  kable_styling(bootstrap_options = c("striped", "condensed", "hover"), full_width = FALSE)
+
+RAW  <- params$dossier_brut
+PROC <- params$dossier_sortie
+dir.create(RAW,  recursive = TRUE, showWarnings = FALSE)
+dir.create(PROC, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Objet du document
+
+1.  **télécharge** les données brutes depuis trois sources ouvertes,
+    sans clé API, dans `r RAW`/ ;
+2.  **construit** la série de consommation **horaire**
+    (`conso_horaire.csv`) et **journalière** (`conso_journaliere.csv`)
+    dans `r PROC`/.
+
+Un fichier brut déjà présent n'est pas retéléchargé. Pour tout reprendre
+de zéro, on tricote avec `params = list(refresh = TRUE)`. Les tables
+produites servent ensuite d'entrée à `R/01_preparation.R` (nettoyage,
+variables explicatives).
+
+| Source | Contenu | Fichier brut |
+|------------------------|------------------------|------------------------|
+| RTE éCO2mix consolidé (ODRÉ) | consommation (MW), prévisions RTE J-1 et J, 2012 → J-90 environ | `rte_cons_def.csv` |
+| RTE éCO2mix temps réel (ODRÉ) | mêmes variables, derniers mois | `rte_tr.csv` |
+| Open-Meteo, archive ERA5 | température horaire à 2 m de 8 villes | `meteo_<ville>.csv` |
+| calendrier.api.gouv.fr | jours fériés de métropole | `jours_feries.csv` |
+
+```{r parametres}
+DEBUT <- as.Date("2012-01-01")
+ODRE  <- "https://odre.opendatasoft.com/api/explore/v2.1/catalog/datasets/%s/exports/csv"
+CHAMPS_RTE <- "date_heure,consommation,prevision_j1,prevision_j"
+
+# Grandes aires urbaines : latitude, longitude, poids ~ population de l'aire (millions d'hab.)
+VILLES <- data.table(
+  ville = c("paris", "lyon", "marseille", "toulouse", "lille", "bordeaux", "nantes", "strasbourg"),
+  lat   = c(48.85, 45.76, 43.30, 43.60, 50.63, 44.84, 47.22, 48.57),
+  lon   = c( 2.35,  4.84,  5.37,  1.44,  3.06, -0.58, -1.55,  7.75),
+  poids = c(13.1,   2.3,   1.9,   1.5,   1.5,   1.4,   1.0,   0.8)
+)
+VILLES[, part := poids / sum(poids)]
+tab(VILLES, digits = 2, caption = "Villes utilisées pour la température nationale")
+```
+
+# Téléchargement des données brutes
+
+## Outils communs
+
+Une requête HTTP avec quelques nouvelles tentatives : Open-Meteo limite
+le nombre d'appels (code 429), on attend alors de plus en plus
+longtemps.
+
+```{r outils}
+h_curl <- function() new_handle(useragent = "ensai-timeseries-project/1.0", timeout = 300)
+
+url_avec <- function(base, params) {
+  if (!length(params)) return(base)
+  q <- paste(names(params), vapply(params, function(v) curl_escape(as.character(v)), ""),
+             sep = "=", collapse = "&")
+  paste0(base, "?", q)
+}
+
+http_get <- function(base, params = list(), essais = 4) {
+  url <- url_avec(base, params)
+  for (i in seq_len(essais)) {
+    r <- tryCatch(curl_fetch_memory(url, handle = h_curl()), error = function(e) NULL)
+    if (!is.null(r) && r$status_code == 429) { Sys.sleep(30 * i); next }   # limite de débit
+    if (!is.null(r) && r$status_code < 400) return(r$content)              # octets bruts
+    if (i < essais) Sys.sleep(5 * i)
+  }
+  stop("échec du téléchargement : ", url)
+}
+
+a_telecharger <- function(f) params$refresh || !file.exists(f)
+```
+
+## Consommation : RTE éCO2mix
+
+Deux jeux de la plateforme ODRÉ, exportés en CSV (séparateur `;`) avec
+des horodatages en **UTC**, pour éviter les ambiguïtés des changements
+d'heure :
+
+- `eco2mix-national-cons-def` : données consolidées puis définitives, de
+  2012 à environ J-90 ;
+- `eco2mix-national-tr` : temps réel, qui complète les derniers mois.
+
+```{r rte}
+telecharger_rte <- function(jeu, fichier) {
+  f <- file.path(RAW, fichier)
+  if (!a_telecharger(f)) return(cat("[cache]", fichier, "\n"))
+  octets <- http_get(sprintf(ODRE, jeu),
+                     list(select = CHAMPS_RTE, delimiter = ";", timezone = "UTC"))
+  writeBin(octets, f)
+  cat("[RTE]", jeu, "->", fichier, sprintf("(%.1f Mo)\n", length(octets) / 1e6))
+}
+telecharger_rte("eco2mix-national-cons-def", "rte_cons_def.csv")
+telecharger_rte("eco2mix-national-tr",       "rte_tr.csv")
+```
+
+## Jours fériés
+
+```{r feries}
+f_fer <- file.path(RAW, "jours_feries.csv")
+if (a_telecharger(f_fer)) {
+  annees <- year(DEBUT):(year(Sys.Date()) + 1)
+  fer <- rbindlist(lapply(annees, function(a) {
+    j <- fromJSON(rawToChar(http_get(
+      sprintf("https://calendrier.api.gouv.fr/jours-feries/metropole/%d.json", a))))
+    data.table(date = names(j), nom = unlist(j, use.names = FALSE))
+  }))
+  setorder(fer, date)
+  fwrite(fer, f_fer)
+  cat("[fériés] ->", nrow(fer), "jours\n")
+} else cat("[cache] jours_feries.csv\n")
+```
+
+## Température : Open-Meteo (ERA5)
+
+Variable `temperature_2m`, horaire, en UTC. L'archive ERA5 est publiée
+avec environ 5 jours de retard : on s'arrête à J-6. Les requêtes sont
+découpées en tranches de 5 ans pour rester sous les limites de l'API.
+
+```{r meteo}
+fin_meteo <- Sys.Date() - 6
+for (k in seq_len(nrow(VILLES))) {
+  v <- VILLES[k]
+  f <- file.path(RAW, sprintf("meteo_%s.csv", v$ville))
+  if (!a_telecharger(f)) { cat("[cache]", basename(f), "\n"); next }
+  morceaux <- list()
+  for (a0 in seq(year(DEBUT), year(fin_meteo), by = 5)) {
+    s <- as.Date(sprintf("%d-01-01", a0))
+    e <- min(as.Date(sprintf("%d-12-31", a0 + 4)), fin_meteo)
+    j <- fromJSON(rawToChar(http_get("https://archive-api.open-meteo.com/v1/archive", list(
+      latitude = v$lat, longitude = v$lon, start_date = format(s), end_date = format(e),
+      hourly = "temperature_2m", timezone = "UTC"))))
+    morceaux[[length(morceaux) + 1]] <- data.table(time = j$hourly$time,
+                                                   temperature = j$hourly$temperature_2m)
+    Sys.sleep(2)
+  }
+  fwrite(rbindlist(morceaux), f)
+  cat("[Open-Meteo]", v$ville, "->", basename(f), "\n")
+}
+```
+
+# Construction de la série horaire
+
+## Consommation RTE
+
+On empile le fichier consolidé puis le temps réel. Sur la période où ils
+se recouvrent, la donnée **consolidée est prioritaire** (elle est
+vérifiée par RTE, le temps réel peut encore être révisé). Dans le
+fichier consolidé, la consommation est fournie toutes les 30 minutes
+alors que la grille est au pas de 15 minutes : les lignes sans
+consommation sont retirées.
+
+```{r lecture_rte}
+lire_rte <- function(fichier) {
+  d <- fread(file.path(RAW, fichier), sep = ";", encoding = "UTF-8",
+             colClasses = list(character = "date_heure"))
+  stopifnot(all(substr(d$date_heure, 20, 25) == "+00:00"))       # tout est bien en UTC
+  d[, date_heure := as.POSIXct(substr(date_heure, 1, 19), format = "%Y-%m-%dT%H:%M:%S", tz = "UTC")]
+  d[, source := fichier][]
+}
+rte <- rbind(lire_rte("rte_cons_def.csv"), lire_rte("rte_tr.csv"))
+bilan_brut <- rte[, .(lignes = .N, conso_presente = sum(!is.na(consommation)),
+                      debut = format(min(date_heure)), fin = format(max(date_heure))), by = source]
+
+rte <- rte[!is.na(consommation)]
+rte <- unique(rte, by = "date_heure")          # garde la 1re occurrence : le consolidé
+setorder(rte, date_heure)
+tab(bilan_brut, caption = "Fichiers RTE bruts (horodatages UTC)")
+rte[, .(points = .N), by = source] |> tab(caption = "Points retenus après fusion")
+```
+
+## Agrégation horaire
+
+La consommation est une puissance moyenne (MW) : la valeur horaire est
+la **moyenne** des points de l'heure. On travaille en UTC, puis on
+complète la grille pour que chaque heure ait une ligne, même sans
+donnée.
+
+```{r horaire}
+
+rte[, heure := as.POSIXct(trunc(as.numeric(date_heure) / 3600) * 3600, origin = "1970-01-01", tz = "UTC")]
+horaire <- rte[, lapply(.SD, mean, na.rm = TRUE), by = heure,
+               .SDcols = c("consommation", "prevision_j1", "prevision_j")]
+for (v in c("consommation", "prevision_j1", "prevision_j"))
+  set(horaire, which(is.nan(horaire[[v]])), v, NA_real_)
+
+grille <- data.table(heure = seq(min(horaire$heure), max(horaire$heure), by = "hour"))
+horaire <- horaire[grille, on = "heure"]
+cat("Heures :", nrow(horaire), "| sans consommation :", sum(is.na(horaire$consommation)), "\n")
+```
+
+## Température nationale pondérée
+
+Pour chaque heure, moyenne des 8 villes pondérée par la population. Si
+une ville manque, les poids sont **renormalisés** sur les villes
+disponibles ; si toutes manquent, la température reste manquante.
+
+```{r temperature}
+meteo <- rbindlist(lapply(seq_len(nrow(VILLES)), function(k) {
+  m <- fread(file.path(RAW, sprintf("meteo_%s.csv", VILLES$ville[k])))
+  m[, .(heure = as.POSIXct(time, format = "%Y-%m-%dT%H:%M", tz = "UTC"),
+        ville = VILLES$ville[k], temperature, poids = VILLES$poids[k])]
+}))
+temp_nat <- meteo[!is.na(temperature),
+                  .(temperature = sum(temperature * poids) / sum(poids)), by = heure]
+horaire <- temp_nat[horaire, on = "heure"]
+setcolorder(horaire, c("heure", "consommation", "prevision_j1", "prevision_j", "temperature"))
+
+meteo[, .(debut = format(min(heure)), fin = format(max(heure)),
+          manquants = sum(is.na(temperature)), moyenne = mean(temperature, na.rm = TRUE)),
+      by = ville] |> tab(caption = "Température par ville (°C)")
+```
+
+## Heure locale et jours fériés
+
+Les modèles raisonnent en heure locale (Europe/Paris) : c'est elle qui
+rythme l'activité. On garde le décalage horaire dans le texte de la date
+(`+01:00` en hiver, `+02:00` en été) pour que chaque horodatage reste
+unique, y compris la nuit du passage à l'heure d'hiver.
+
+```{r local}
+fer <- fread(file.path(RAW, "jours_feries.csv"), colClasses = c(date = "Date"))
+horaire[, local := format(heure, "%Y-%m-%d %H:%M:%S", tz = "Europe/Paris")]
+horaire[, jour_local := as.Date(substr(local, 1, 10))]
+horaire[, ferie := jour_local %in% fer$date]
+
+# on coupe la grille à la première et la dernière consommation observée
+idx <- which(!is.na(horaire$consommation))
+horaire <- horaire[min(idx):max(idx)]
+```
+
+```{r ecriture_horaire}
+decalage <- format(horaire$heure, "%z", tz = "Europe/Paris")              # ex. "+0100"
+sortie_h <- horaire[, .(datetime = paste0(local, substr(decalage, 1, 3), ":", substr(decalage, 4, 5)),
+                        consommation, prevision_j1, prevision_j, temperature,
+                        ferie = ifelse(ferie, "True", "False"))]
+fwrite(sortie_h, file.path(PROC, "conso_horaire.csv"))
+head(sortie_h)
+```
+
+# Construction de la série journalière
+
+Le jour est le **jour local**. Pour chaque jour :
+
+- `consommation` : puissance moyenne (MW) ;
+- `energie_GWh` : énergie consommée, somme des puissances horaires
+  divisée par 1 000 ;
+- `prevision_j1` : moyenne de la prévision J-1 de RTE ;
+- `temp_moy`, `temp_min`, `temp_max` : température nationale ;
+- `n_heures` : nombre d'heures où la consommation est observée.
+
+Un jour normal compte 24 heures, 23 au passage à l'heure d'été et 25 au
+passage à l'heure d'hiver. On **écarte les jours de moins de 22 heures
+observées**, dont la moyenne serait biaisée (en pratique le dernier
+jour, incomplet).
+
+```{r journalier}
+na_si_vide <- function(f) function(x) if (all(is.na(x))) NA_real_ else f(x, na.rm = TRUE)
+journalier <- horaire[, .(
+  consommation = mean(consommation, na.rm = TRUE),
+  energie_GWh  = sum(consommation, na.rm = TRUE) / 1000,
+  prevision_j1 = na_si_vide(mean)(prevision_j1),
+  temp_moy     = na_si_vide(mean)(temperature),
+  temp_min     = na_si_vide(min)(temperature),
+  temp_max     = na_si_vide(max)(temperature),
+  n_heures     = sum(!is.na(consommation))
+), by = .(date = jour_local)]
+journalier[, ferie := date %in% fer$date]
+
+table(n_heures = journalier$n_heures)
+journalier <- journalier[n_heures >= 22]
+
+fwrite(journalier[, !"ferie"][, ferie := ifelse(journalier$ferie, "True", "False")],
+       file.path(PROC, "conso_journaliere.csv"))
+```
+
+# Contrôles
+
+```{r resume}
+data.table(
+  table   = c("conso_horaire.csv", "conso_journaliere.csv"),
+  lignes  = c(nrow(sortie_h), nrow(journalier)),
+  debut   = c(sortie_h$datetime[1], format(min(journalier$date))),
+  fin     = c(sortie_h$datetime[nrow(sortie_h)], format(max(journalier$date))),
+  conso_manquante = c(sum(is.na(sortie_h$consommation)), sum(is.na(journalier$consommation))),
+  temp_manquante  = c(sum(is.na(sortie_h$temperature)), sum(is.na(journalier$temp_moy)))
+) |> tab(caption = "Tables produites")
+
+vars <- c("consommation", "energie_GWh", "prevision_j1", "temp_moy", "temp_min", "temp_max")
+journalier[, lapply(.SD, function(x) c(mean(x, na.rm = TRUE), min(x, na.rm = TRUE), max(x, na.rm = TRUE))),
+           .SDcols = vars][, stat := c("moyenne", "min", "max")][] |>
+  melt(id.vars = "stat") |> dcast(variable ~ stat) |>
+  setcolorder(c("variable", "moyenne", "min", "max")) |> tab(caption = "Série journalière")
+```
+
+Les températures manquantes sont en fin de série : ERA5 n'est pas encore
+publié pour les derniers jours.
+
+```{r graphique, fig.height=4.5}
+ggplot(journalier, aes(date, consommation / 1000)) +
+  geom_line(colour = NEUTRE, linewidth = 0.25) +
+  labs(title = "Consommation journalière , France métropolitaine",
+       subtitle = "Valeur quotidienne (gris) et moyenne mobile sur 365 jours (bleu)",
+       x = NULL, y = "GW", caption = SOURCE)
+```
+
+```{r session, echo=FALSE}
+cat("Tables écrites dans", normalizePath(PROC), "le", format(Sys.time(), "%d/%m/%Y %H:%M"), "\n")
+```
+
+```{r}
+tail(journalier)
+```
+
+```{r}
+data <- journalier |> dplyr::select(date, consommation)
+head(data)
+```
+
+Différence saisonnière annuelle : $y_t - y_{t-365}$.
+
+```{r}
+data_diff_365 <- diff(data$consommation, lag = 365)
+```
+
+
+```{r}
+plot(data$date[-(1:365)], data_diff_365, type = "l",
+     xlab = NULL, ylab = "MW", main = "Consommation différenciée (lag 365)")
+```
+
+
+```{r}
+acf(data_diff_365)
+```
+

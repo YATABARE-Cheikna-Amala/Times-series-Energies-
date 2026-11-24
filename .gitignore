@@ -1,0 +1,11 @@
+# Le dépôt ne contient que ce qu'il faut pour tricoter chargement_donnees.Rmd
+/*
+!/.gitignore
+!/.gitattributes
+!/chargement_donnees.Rmd
+!/R/
+/R/*
+!/R/00_theme.R
+!/data/
+/data/*
+!/data/raw/
