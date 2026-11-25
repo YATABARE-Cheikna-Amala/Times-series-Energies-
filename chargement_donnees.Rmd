@@ -36,6 +36,11 @@ tab <- function(x, digits = 1, ...) kbl(x, digits = digits, format.args = list(b
 
 RAW  <- params$dossier_brut
 dir.create(RAW,  recursive = TRUE, showWarnings = FALSE)
+
+# Si la base journalière existe déjà, on la lit directement : pas de téléchargement
+# ni de reconstruction. refresh = TRUE force tout à être refait.
+F_JOUR     <- file.path(RAW, "conso_journaliere.csv")
+CONSTRUIRE <- params$refresh || !file.exists(F_JOUR)
 ```
 
 # Objet du document
@@ -46,10 +51,17 @@ dir.create(RAW,  recursive = TRUE, showWarnings = FALSE)
     intermédiaire), puis la base **journalière**, seule base
     enregistrée, avec toutes ses colonnes : `r RAW`/conso_journaliere.csv.
 
-Un fichier brut déjà présent n'est pas retéléchargé. Pour tout reprendre
-de zéro, on tricote avec `params = list(refresh = TRUE)`. Les tables
-produites servent ensuite d'entrée à `R/01_preparation.R` (nettoyage,
-variables explicatives).
+**Si `r RAW`/conso_journaliere.csv existe déjà, il est lu directement**
+et les étapes 1 et 2 sont sautées (voir la section *Lecture de la base
+journalière*). Sinon, un fichier brut déjà présent n'est pas
+retéléchargé. Pour tout reprendre de zéro, on tricote avec
+`params = list(refresh = TRUE)`. Les tables produites servent ensuite
+d'entrée à `R/01_preparation.R` (nettoyage, variables explicatives).
+
+```{r mode, echo=FALSE, results="asis"}
+cat(if (CONSTRUIRE) "> Mode de ce tricotage : **construction** de la base à partir des sources.\n"
+    else "> Mode de ce tricotage : **lecture** de la base existante, sans téléchargement.\n")
+```
 
 | Source | Contenu | Fichier brut |
 |------------------------|------------------------|------------------------|
@@ -82,7 +94,7 @@ Une requête HTTP avec quelques nouvelles tentatives : Open-Meteo limite
 le nombre d'appels (code 429), on attend alors de plus en plus
 longtemps.
 
-```{r outils}
+```{r outils, eval = CONSTRUIRE}
 h_curl <- function() new_handle(useragent = "ensai-timeseries-project/1.0", timeout = 300)
 
 url_avec <- function(base, params) {
@@ -116,7 +128,7 @@ d'heure :
   2012 à environ J-90 ;
 - `eco2mix-national-tr` : temps réel, qui complète les derniers mois.
 
-```{r rte}
+```{r rte, eval = CONSTRUIRE}
 telecharger_rte <- function(jeu, fichier) {
   f <- file.path(RAW, fichier)
   if (!a_telecharger(f)) return(cat("[cache]", fichier, "\n"))
@@ -131,7 +143,7 @@ telecharger_rte("eco2mix-national-tr",       "rte_tr.csv")
 
 ## Jours fériés
 
-```{r feries}
+```{r feries, eval = CONSTRUIRE}
 f_fer <- file.path(RAW, "jours_feries.csv")
 if (a_telecharger(f_fer)) {
   annees <- year(DEBUT):(year(Sys.Date()) + 1)
@@ -152,7 +164,7 @@ Variable `temperature_2m`, horaire, en UTC. L'archive ERA5 est publiée
 avec environ 5 jours de retard : on s'arrête à J-6. Les requêtes sont
 découpées en tranches de 5 ans pour rester sous les limites de l'API.
 
-```{r meteo}
+```{r meteo, eval = CONSTRUIRE}
 fin_meteo <- Sys.Date() - 6
 for (k in seq_len(nrow(VILLES))) {
   v <- VILLES[k]
@@ -185,7 +197,7 @@ fichier consolidé, la consommation est fournie toutes les 30 minutes
 alors que la grille est au pas de 15 minutes : les lignes sans
 consommation sont retirées.
 
-```{r lecture_rte}
+```{r lecture_rte, eval = CONSTRUIRE}
 lire_rte <- function(fichier) {
   d <- fread(file.path(RAW, fichier), sep = ";", encoding = "UTF-8",
              colClasses = list(character = "date_heure"))
@@ -211,7 +223,7 @@ la **moyenne** des points de l'heure. On travaille en UTC, puis on
 complète la grille pour que chaque heure ait une ligne, même sans
 donnée.
 
-```{r horaire}
+```{r horaire, eval = CONSTRUIRE}
 
 rte[, heure := as.POSIXct(trunc(as.numeric(date_heure) / 3600) * 3600, origin = "1970-01-01", tz = "UTC")]
 horaire <- rte[, lapply(.SD, mean, na.rm = TRUE), by = heure,
@@ -230,7 +242,7 @@ Pour chaque heure, moyenne des 8 villes pondérée par la population. Si
 une ville manque, les poids sont **renormalisés** sur les villes
 disponibles ; si toutes manquent, la température reste manquante.
 
-```{r temperature}
+```{r temperature, eval = CONSTRUIRE}
 meteo <- rbindlist(lapply(seq_len(nrow(VILLES)), function(k) {
   m <- fread(file.path(RAW, sprintf("meteo_%s.csv", VILLES$ville[k])))
   m[, .(heure = as.POSIXct(time, format = "%Y-%m-%dT%H:%M", tz = "UTC"),
@@ -253,7 +265,7 @@ rythme l'activité. On garde le décalage horaire dans le texte de la date
 (`+01:00` en hiver, `+02:00` en été) pour que chaque horodatage reste
 unique, y compris la nuit du passage à l'heure d'hiver.
 
-```{r local}
+```{r local, eval = CONSTRUIRE}
 fer <- fread(file.path(RAW, "jours_feries.csv"), colClasses = c(date = "Date"))
 horaire[, local := format(heure, "%Y-%m-%d %H:%M:%S", tz = "Europe/Paris")]
 horaire[, jour_local := as.Date(substr(local, 1, 10))]
@@ -264,7 +276,7 @@ idx <- which(!is.na(horaire$consommation))
 horaire <- horaire[min(idx):max(idx)]
 ```
 
-```{r ecriture_horaire}
+```{r ecriture_horaire, eval = CONSTRUIRE}
 decalage <- format(horaire$heure, "%z", tz = "Europe/Paris")              # ex. "+0100"
 sortie_h <- horaire[, .(datetime = paste0(local, substr(decalage, 1, 3), ":", substr(decalage, 4, 5)),
                         consommation, prevision_j1, prevision_j, temperature,
@@ -288,7 +300,7 @@ passage à l'heure d'hiver. On **écarte les jours de moins de 22 heures
 observées**, dont la moyenne serait biaisée (en pratique le dernier
 jour, incomplet).
 
-```{r journalier}
+```{r journalier, eval = CONSTRUIRE}
 na_si_vide <- function(f) function(x) if (all(is.na(x))) NA_real_ else f(x, na.rm = TRUE)
 journalier <- horaire[, .(
   consommation = mean(consommation, na.rm = TRUE),
@@ -305,12 +317,23 @@ table(n_heures = journalier$n_heures)
 journalier <- journalier[n_heures >= 22]
 
 fwrite(journalier[, !"ferie"][, ferie := ifelse(journalier$ferie, "True", "False")],
-       file.path(RAW, "conso_journaliere.csv"))
+       F_JOUR)
+```
+
+# Lecture de la base journalière
+
+Quand la base existe déjà, c'est la seule étape exécutée avant les
+contrôles : on la relit avec les mêmes types qu'à sa construction.
+
+```{r lecture_journalier, eval = !CONSTRUIRE}
+journalier <- fread(F_JOUR, colClasses = list(Date = "date", character = "ferie"))
+journalier[, ferie := ferie == "True"]
+str(journalier)
 ```
 
 # Contrôles
 
-```{r resume}
+```{r resume_construction, eval = CONSTRUIRE}
 data.table(
   table   = c("série horaire (non enregistrée)", "conso_journaliere.csv"),
   lignes  = c(nrow(sortie_h), nrow(journalier)),
@@ -319,7 +342,9 @@ data.table(
   conso_manquante = c(sum(is.na(sortie_h$consommation)), sum(is.na(journalier$consommation))),
   temp_manquante  = c(sum(is.na(sortie_h$temperature)), sum(is.na(journalier$temp_moy)))
 ) |> tab(caption = "Tables produites")
+```
 
+```{r resume}
 vars <- c("consommation", "energie_GWh", "prevision_j1", "temp_moy", "temp_min", "temp_max")
 journalier[, lapply(.SD, function(x) c(mean(x, na.rm = TRUE), min(x, na.rm = TRUE), max(x, na.rm = TRUE))),
            .SDcols = vars][, stat := c("moyenne", "min", "max")][] |>
