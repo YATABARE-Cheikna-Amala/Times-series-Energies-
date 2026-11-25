@@ -16,7 +16,6 @@ output:
 params:
   refresh: false            # TRUE : retélécharge toutes les sources brutes
   dossier_brut: "data/raw"
-  dossier_sortie: "data/processed"
 editor_options: 
   markdown: 
     wrap: 72
@@ -36,18 +35,16 @@ tab <- function(x, digits = 1, ...) kbl(x, digits = digits, format.args = list(b
   kable_styling(bootstrap_options = c("striped", "condensed", "hover"), full_width = FALSE)
 
 RAW  <- params$dossier_brut
-PROC <- params$dossier_sortie
 dir.create(RAW,  recursive = TRUE, showWarnings = FALSE)
-dir.create(PROC, recursive = TRUE, showWarnings = FALSE)
 ```
 
 # Objet du document
 
 1.  **télécharge** les données brutes depuis trois sources ouvertes,
     sans clé API, dans `r RAW`/ ;
-2.  **construit** la série de consommation **horaire**
-    (`conso_horaire.csv`) et **journalière** (`conso_journaliere.csv`)
-    dans `r PROC`/.
+2.  **construit** la série de consommation **horaire** (étape
+    intermédiaire), puis la base **journalière**, seule base
+    enregistrée, avec toutes ses colonnes : `r RAW`/conso_journaliere.csv.
 
 Un fichier brut déjà présent n'est pas retéléchargé. Pour tout reprendre
 de zéro, on tricote avec `params = list(refresh = TRUE)`. Les tables
@@ -272,7 +269,6 @@ decalage <- format(horaire$heure, "%z", tz = "Europe/Paris")              # ex. 
 sortie_h <- horaire[, .(datetime = paste0(local, substr(decalage, 1, 3), ":", substr(decalage, 4, 5)),
                         consommation, prevision_j1, prevision_j, temperature,
                         ferie = ifelse(ferie, "True", "False"))]
-fwrite(sortie_h, file.path(PROC, "conso_horaire.csv"))
 head(sortie_h)
 ```
 
@@ -309,14 +305,14 @@ table(n_heures = journalier$n_heures)
 journalier <- journalier[n_heures >= 22]
 
 fwrite(journalier[, !"ferie"][, ferie := ifelse(journalier$ferie, "True", "False")],
-       file.path(PROC, "conso_journaliere.csv"))
+       file.path(RAW, "conso_journaliere.csv"))
 ```
 
 # Contrôles
 
 ```{r resume}
 data.table(
-  table   = c("conso_horaire.csv", "conso_journaliere.csv"),
+  table   = c("série horaire (non enregistrée)", "conso_journaliere.csv"),
   lignes  = c(nrow(sortie_h), nrow(journalier)),
   debut   = c(sortie_h$datetime[1], format(min(journalier$date))),
   fin     = c(sortie_h$datetime[nrow(sortie_h)], format(max(journalier$date))),
@@ -335,16 +331,21 @@ Les températures manquantes sont en fin de série : ERA5 n'est pas encore
 publié pour les derniers jours.
 
 ```{r graphique, fig.height=4.5}
-ggplot(journalier, aes(date, consommation / 1000)) +
+ggplot(journalier, aes(date, consommation )) +
   geom_line(colour = NEUTRE, linewidth = 0.25) +
   labs(title = "Consommation journalière , France métropolitaine",
        subtitle = "Valeur quotidienne (gris) et moyenne mobile sur 365 jours (bleu)",
        x = NULL, y = "GW", caption = SOURCE)
 ```
 
-```{r session, echo=FALSE}
-cat("Tables écrites dans", normalizePath(PROC), "le", format(Sys.time(), "%d/%m/%Y %H:%M"), "\n")
+
+## representation de l'ACF
+
+```{r}
+acf(journalier$consommation,lag.max = 60)
 ```
+la fonction d'autocorrelation ne diminue pas, donc la correlation entre les retards de la serie reste dependante entre elle meme. pour cela nous allons differencier la serie pour voir comment se comporte l'ACF.
+
 
 ```{r}
 tail(journalier)
@@ -355,7 +356,8 @@ data <- journalier |> dplyr::select(date, consommation)
 head(data)
 ```
 
-Différence saisonnière annuelle : $y_t - y_{t-365}$.
+##Différence saisonnière annuelle : 
+                          $y_t - y_{t-365}$.
 
 ```{r}
 data_diff_365 <- diff(data$consommation, lag = 365)
@@ -366,9 +368,62 @@ data_diff_365 <- diff(data$consommation, lag = 365)
 plot(data$date[-(1:365)], data_diff_365, type = "l",
      xlab = NULL, ylab = "MW", main = "Consommation différenciée (lag 365)")
 ```
+la serie différenciée a permis de supprimer la saisonnalité annuelle qui apparaissait a des intervalles réguliers.
 
+## Verification de l'ACF de la serie différentié
 
 ```{r}
 acf(data_diff_365)
 ```
+Malgrès la différenciation annuelle de la serie, on observe que certaines retard reste toujours corrélée ensemble.
 
+
+## Effectuons une différenciation sur le mois
+
+```{r}
+data_diff_30 = diff(data_diff_365, differences = 30)
+```
+
+```{r}
+plot(data_diff_30, type = "l",
+     xlab = NULL, ylab = "MW", main = "Consommation différenciée (lag 365) ensuite lag 30")
+```
+
+
+## Verification de l'ACF
+
+```{r}
+acf(data_diff_30)
+```
+
+la serie presente toujours une composante saisonnière, pour cela, nous allons enlever la saisonnalité pouvant intervenir par semaine
+
+```{r}
+data_diff_7 = diff(data_diff_30, differences = 7)
+```
+
+```{r}
+plot(data_diff_7, type = "l",
+     xlab = NULL, ylab = "MW", main = "Consommation différenciée (lag 365) ensuite lag 30 et lag 7")
+```
+
+```{r}
+acf(data_diff_7, lag.max = 60,
+    main = "ACF après différenciation hebdomadaire")
+```
+
+```{r}
+pacf(data_diff_7, lag.max = 60,
+     main = "PACF après différenciation hebdomadaire")
+```
+
+
+
+
+
+
+
+
+```{r session, echo=FALSE}
+cat("Base journalière écrite dans", normalizePath(file.path(RAW, "conso_journaliere.csv")), "le", format(Sys.time(), "%d/%m/%Y %H:%M"), "\n")
+```

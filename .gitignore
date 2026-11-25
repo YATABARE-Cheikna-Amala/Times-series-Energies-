@@ -1,4 +1,4 @@
-# Le dépôt ne contient que ce qu'il faut pour tricoter chargement_donnees.Rmd
+# Le dépôt ne contient que le Rmd, le thème et la base journalière
 /*
 !/.gitignore
 !/.gitattributes
@@ -9,3 +9,5 @@
 !/data/
 /data/*
 !/data/raw/
+/data/raw/*
+!/data/raw/conso_journaliere.csv
